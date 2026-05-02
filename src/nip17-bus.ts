@@ -54,7 +54,8 @@ export interface Nip17BusOptions {
     text: string,
     reply: (text: string) => Promise<void>,
     media: DecryptedMedia[] | undefined,
-    react: (emoji: string) => Promise<void>,
+    react: (emoji: string) => Promise<string | undefined>,
+    deleteReactions: (rumorIds: string[]) => Promise<void>,
   ) => Promise<void>;
   onError?: (error: Error, context: string) => void;
   onConnect?: (relay: string) => void;
@@ -66,7 +67,8 @@ export interface Nip17BusHandle {
   close: () => void;
   publicKey: string;
   sendDm: (toPubkey: string, text: string) => Promise<void>;
-  sendReaction: (toPubkey: string, rumorId: string, emoji: string) => Promise<void>;
+  sendReaction: (toPubkey: string, rumorId: string, emoji: string) => Promise<string>;
+  sendDeletion: (toPubkey: string, rumorIds: string[]) => Promise<void>;
 }
 
 // ============================================================================
@@ -275,13 +277,26 @@ export async function startNip17Bus(options: Nip17BusOptions): Promise<Nip17BusH
         }
       };
 
-      // Create reaction function — targets this rumor (NIP-25 + ["k", "14"]),
-      // wrapped to prevent unhandled rejections
-      const reactFn = async (emoji: string): Promise<void> => {
+      // Create reaction function — targets this rumor (NIP-25 + ["k", "14"]).
+      // Returns the reaction rumor.id on success (so the channel can later
+      // issue a NIP-09 deletion), or undefined if the publish failed.
+      // Failures are reported via onError; the function never rejects.
+      const reactFn = async (emoji: string): Promise<string | undefined> => {
         try {
-          await sendNip17Reaction(pool, sk, senderPubkey, rumor.id, emoji, relays, trustedRelays, onError);
+          return await sendNip17Reaction(pool, sk, senderPubkey, rumor.id, emoji, relays, trustedRelays, onError);
         } catch (err) {
           onError?.(err as Error, `react ${emoji} to ${senderPubkey}`);
+          return undefined;
+        }
+      };
+
+      // Create deletion function — best-effort batch delete of reaction rumor
+      // ids previously returned by reactFn. Wrapped to prevent unhandled rejections.
+      const deleteFn = async (rumorIds: string[]): Promise<void> => {
+        try {
+          await sendNip17Deletion(pool, sk, senderPubkey, rumorIds, relays, trustedRelays, onError);
+        } catch (err) {
+          onError?.(err as Error, `delete ${rumorIds.length} reactions for ${senderPubkey}`);
         }
       };
 
@@ -338,7 +353,7 @@ export async function startNip17Bus(options: Nip17BusOptions): Promise<Nip17BusH
         }
       }
 
-      await onMessage(senderPubkey, text, replyFn, decryptedMedia, reactFn);
+      await onMessage(senderPubkey, text, replyFn, decryptedMedia, reactFn, deleteFn);
       lastRumorAt = Math.max(lastRumorAt, rumor.created_at);
       scheduleStatePersist(event.created_at, event.id);
     } catch (err) {
@@ -418,8 +433,12 @@ export async function startNip17Bus(options: Nip17BusOptions): Promise<Nip17BusH
     await sendNip17Dm(pool, sk, toPubkey, text, relays, trustedRelays, onError);
   };
 
-  const sendReaction = async (toPubkey: string, rumorId: string, emoji: string): Promise<void> => {
-    await sendNip17Reaction(pool, sk, toPubkey, rumorId, emoji, relays, trustedRelays, onError);
+  const sendReaction = async (toPubkey: string, rumorId: string, emoji: string): Promise<string> => {
+    return sendNip17Reaction(pool, sk, toPubkey, rumorId, emoji, relays, trustedRelays, onError);
+  };
+
+  const sendDeletion = async (toPubkey: string, rumorIds: string[]): Promise<void> => {
+    await sendNip17Deletion(pool, sk, toPubkey, rumorIds, relays, trustedRelays, onError);
   };
 
   return {
@@ -433,6 +452,7 @@ export async function startNip17Bus(options: Nip17BusOptions): Promise<Nip17BusH
     publicKey: pk,
     sendDm,
     sendReaction,
+    sendDeletion,
   };
 }
 
@@ -448,7 +468,7 @@ async function publishWrappedRumor(
   relays: string[],
   trustedRelays: Set<string>,
   onError?: (error: Error, context: string) => void,
-): Promise<void> {
+): Promise<string> {
   const pk = getPublicKey(sk);
 
   // NIP-42 auth signer — only signs for relays in our config to prevent privacy leaks.
@@ -556,6 +576,8 @@ async function publishWrappedRumor(
       "publish"
     );
   }
+
+  return rumor.id;
 }
 
 async function sendNip17Dm(
@@ -580,6 +602,8 @@ async function sendNip17Dm(
 
 // NIP-25 reaction wrapped per NIP-17. The ["k", "14"] tag tells clients the
 // reaction targets a kind:14 chat message; the ["e", rumorId] points at it.
+// Returns the rumor.id of the reaction itself, so callers can later issue a
+// NIP-09 deletion against it.
 async function sendNip17Reaction(
   pool: SimplePool,
   sk: Uint8Array,
@@ -589,8 +613,8 @@ async function sendNip17Reaction(
   relays: string[],
   trustedRelays: Set<string>,
   onError?: (error: Error, context: string) => void,
-): Promise<void> {
-  await publishWrappedRumor(
+): Promise<string> {
+  return publishWrappedRumor(
     pool,
     sk,
     toPubkey,
@@ -599,6 +623,33 @@ async function sendNip17Reaction(
       content: emoji,
       tags: [["e", rumorId], ["p", toPubkey], ["k", "14"]],
     },
+    relays,
+    trustedRelays,
+    onError,
+  );
+}
+
+// NIP-09 deletion wrapped per NIP-17. Targets a batch of kind:7 reaction
+// rumor ids so a recipient client honoring NIP-09 can clear the row when a
+// proper reply lands. ["k", "7"] disambiguates the deleted event kind.
+async function sendNip17Deletion(
+  pool: SimplePool,
+  sk: Uint8Array,
+  toPubkey: string,
+  rumorIds: string[],
+  relays: string[],
+  trustedRelays: Set<string>,
+  onError?: (error: Error, context: string) => void,
+): Promise<void> {
+  if (rumorIds.length === 0) return;
+  const tags: string[][] = rumorIds.map((id) => ["e", id]);
+  tags.push(["p", toPubkey]);
+  tags.push(["k", "7"]);
+  await publishWrappedRumor(
+    pool,
+    sk,
+    toPubkey,
+    { kind: 5, content: "", tags },
     relays,
     trustedRelays,
     onError,
