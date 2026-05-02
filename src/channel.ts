@@ -218,15 +218,17 @@ export const nip17Plugin: ChannelPlugin<ResolvedNip17Account> = {
         accountId: account.accountId,
         privateKey: account.privateKey,
         relays: account.relays,
-        onMessage: async (senderPubkey, text, replyFn, media, reactFn) => {
+        onMessage: async (senderPubkey, text, replyFn, media, reactFn, deleteFn) => {
           const hasMedia = media && media.length > 0;
           const mediaDesc = hasMedia ? ` with ${media.length} media attachment(s)` : "";
           ctx.log?.info(`[${account.accountId}] NIP-17 DM from ${senderPubkey}${mediaDesc}: ${text.slice(0, 50)}...`);
 
-          // One helper for every reaction call site (receipt + onReplyStart +
-          // event-driven). reactFn already reports failures via onError.
+          // Track every reaction publish so we can NIP-09-delete them all once
+          // a proper reply lands. reactFn resolves to the reaction rumor.id on
+          // success, undefined on failure (already reported via onError).
+          const reactionPublishes: Array<Promise<string | undefined>> = [];
           const fireReaction = (emoji: string): void => {
-            void reactFn(emoji).catch(() => {});
+            reactionPublishes.push(reactFn(emoji).catch(() => undefined));
           };
 
           // Receipt: fires before any guard / model selection so the sender
@@ -340,6 +342,7 @@ export const nip17Plugin: ChannelPlugin<ResolvedNip17Account> = {
           // dispatcherOptions: delivery + typing-side hooks (onReplyStart lives here).
           // replyOptions: agent-lifecycle hooks (tool/plan/compaction) and onModelSelected,
           // which the prefix template needs to interpolate {{model}} post-fallback.
+          let replied = false;
           await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
             ctx: ctxPayload,
             cfg,
@@ -350,6 +353,7 @@ export const nip17Plugin: ChannelPlugin<ResolvedNip17Account> = {
                 const responseText = payload.text ?? "";
                 if (responseText.trim()) {
                   await replyFn(responseText);
+                  replied = true;
                   ctx.log?.info(`[${account.accountId}] NIP-17 reply sent to ${senderPubkey}`);
                 }
               },
@@ -364,6 +368,19 @@ export const nip17Plugin: ChannelPlugin<ResolvedNip17Account> = {
               onCompactionStart: () => fireReaction(EVENT_EMOJI.compactionStart),
             },
           });
+
+          // Once a real reply has landed, clear the reaction row by deleting
+          // every reaction we published for this DM (NIP-09, gift-wrapped per
+          // NIP-17). Fire-and-forget so the next inbound DM isn't blocked on
+          // cleanup; failures already surface via onError inside deleteFn.
+          if (replied && reactionPublishes.length > 0) {
+            void (async () => {
+              const ids = (await Promise.all(reactionPublishes)).filter(
+                (id): id is string => typeof id === "string" && id.length > 0,
+              );
+              if (ids.length > 0) await deleteFn(ids);
+            })();
+          }
         },
         onError: (error, context) => {
           ctx.log?.error?.(`[${account.accountId}] NIP-17 error (${context}): ${error.message}`);
