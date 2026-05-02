@@ -336,17 +336,16 @@ export const nip17Plugin: ChannelPlugin<ResolvedNip17Account> = {
             accountId: account.accountId,
           });
 
-          // Dispatch reply through the full pipeline
+          // Dispatch reply through the full pipeline.
+          // dispatcherOptions: delivery + typing-side hooks (onReplyStart lives here).
+          // replyOptions: agent-lifecycle hooks (tool/plan/compaction) and onModelSelected,
+          // which the prefix template needs to interpolate {{model}} post-fallback.
           await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
             ctx: ctxPayload,
             cfg,
             dispatcherOptions: {
               ...prefixOptions,
-              onModelSelected,
               onReplyStart: () => fireReaction(pickThinking()),
-              onToolStart: () => fireReaction(EVENT_EMOJI.toolStart),
-              onPlanUpdate: () => fireReaction(EVENT_EMOJI.planUpdate),
-              onCompactionStart: () => fireReaction(EVENT_EMOJI.compactionStart),
               deliver: async (payload: { text?: string; mediaPath?: string }) => {
                 const responseText = payload.text ?? "";
                 if (responseText.trim()) {
@@ -357,6 +356,12 @@ export const nip17Plugin: ChannelPlugin<ResolvedNip17Account> = {
               onError: (err: unknown) => {
                 ctx.log?.error?.(`[${account.accountId}] NIP-17 reply error: ${String(err)}`);
               },
+            },
+            replyOptions: {
+              onModelSelected,
+              onToolStart: () => fireReaction(EVENT_EMOJI.toolStart),
+              onPlanUpdate: () => fireReaction(EVENT_EMOJI.planUpdate),
+              onCompactionStart: () => fireReaction(EVENT_EMOJI.compactionStart),
             },
           });
         },
