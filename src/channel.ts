@@ -1,5 +1,5 @@
 import { type ChannelPlugin, DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/core";
-import { createReplyPrefixOptions } from "openclaw/plugin-sdk/channel-runtime";
+import { createReplyPrefixOptions, createTypingCallbacks } from "openclaw/plugin-sdk/channel-runtime";
 import { buildChannelConfigSchema, collectStatusIssuesFromLastError, createDefaultChannelRuntimeState, formatPairingApproveHint } from "openclaw/plugin-sdk/nostr";
 import { Nip17ConfigSchema } from "./config-schema.js";
 import { normalizePubkey, startNip17Bus, type Nip17BusHandle } from "./nip17-bus.js";
@@ -15,6 +15,12 @@ import * as path from "path";
 import * as os from "os";
 
 const activeBuses = new Map<string, Nip17BusHandle>();
+
+// Visible feedback while a reply is being computed. Sent as kind:7 reactions
+// (NIP-25, gift-wrapped per NIP-17) targeting the inbound rumor. Single pass —
+// no looping; once exhausted, the row stops growing.
+const THINKING_EMOJIS = ["💭", "🧠", "🤔", "💡", "⚙️", "🔍", "📚", "⏳"];
+const THINKING_INTERVAL_MS = 5000;
 
 async function ensureActiveBus(accountId: string): Promise<Nip17BusHandle> {
   const existing = activeBuses.get(accountId);
@@ -203,10 +209,16 @@ export const nip17Plugin: ChannelPlugin<ResolvedNip17Account> = {
         accountId: account.accountId,
         privateKey: account.privateKey,
         relays: account.relays,
-        onMessage: async (senderPubkey, text, replyFn, media) => {
+        onMessage: async (senderPubkey, text, replyFn, media, reactFn) => {
           const hasMedia = media && media.length > 0;
           const mediaDesc = hasMedia ? ` with ${media.length} media attachment(s)` : "";
           ctx.log?.info(`[${account.accountId}] NIP-17 DM from ${senderPubkey}${mediaDesc}: ${text.slice(0, 50)}...`);
+
+          // Receipt: fire-and-forget so the sender sees a reaction even if the
+          // reply pipeline guards short-circuit (pairing/policy/no-binding).
+          // Intentionally outside the typing cycle — this is a "received"
+          // signal, not a "thinking" signal.
+          void reactFn("🤙").catch(() => { /* logged via onError in bus */ });
 
           const cfg = runtime.config.loadConfig();
 
@@ -311,6 +323,23 @@ export const nip17Plugin: ChannelPlugin<ResolvedNip17Account> = {
             accountId: account.accountId,
           });
 
+          // Thinking cycle: walk THINKING_EMOJIS once, no looping. The
+          // dispatcher invokes start() on reply-start, then re-invokes it
+          // every keepaliveIntervalMs until first deliver, NO_REPLY, or abort
+          // — at which point onCleanup fires. maxDurationMs is a safety TTL.
+          let cycleIndex = 0;
+          const typing = createTypingCallbacks({
+            start: async () => {
+              if (cycleIndex >= THINKING_EMOJIS.length) return;
+              const emoji = THINKING_EMOJIS[cycleIndex++];
+              await reactFn(emoji);
+            },
+            stop: async () => { /* no completion emoji — reply DM is the signal */ },
+            onStartError: () => { /* swallow; reactFn already reports via onError */ },
+            keepaliveIntervalMs: THINKING_INTERVAL_MS,
+            maxDurationMs: THINKING_EMOJIS.length * THINKING_INTERVAL_MS,
+          });
+
           // Dispatch reply through the full pipeline
           await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
             ctx: ctxPayload,
@@ -318,6 +347,8 @@ export const nip17Plugin: ChannelPlugin<ResolvedNip17Account> = {
             dispatcherOptions: {
               ...prefixOptions,
               onModelSelected,
+              onReplyStart: typing.onReplyStart,
+              onTypingCleanup: typing.onCleanup,
               deliver: async (payload: { text?: string; mediaPath?: string }) => {
                 const responseText = payload.text ?? "";
                 if (responseText.trim()) {
