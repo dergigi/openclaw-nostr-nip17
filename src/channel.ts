@@ -22,6 +22,14 @@ const activeBuses = new Map<string, Nip17BusHandle>();
 const THINKING_EMOJIS = ["💭", "🧠", "🤔", "💡", "⚙️", "🔍", "📚", "⏳"];
 const THINKING_INTERVAL_MS = 5000;
 
+// Event-driven reactions on top of the time-based cycle. Fired once per
+// dispatcher event, no dedup, no per-reply caps — stacking is desired UX.
+const EVENT_EMOJI = {
+  toolStart: "🔧",
+  planUpdate: "📋",
+  compactionStart: "🗜️",
+} as const;
+
 async function ensureActiveBus(accountId: string): Promise<Nip17BusHandle> {
   const existing = activeBuses.get(accountId);
   if (existing) return existing;
@@ -340,6 +348,13 @@ export const nip17Plugin: ChannelPlugin<ResolvedNip17Account> = {
             maxDurationMs: THINKING_EMOJIS.length * THINKING_INTERVAL_MS,
           });
 
+          // Event-driven reactions: fire-and-forget so the reply path is
+          // never blocked by a slow relay. reactFn already reports failures
+          // via onError. Coexists with the time-based cycle (stacking is OK).
+          const reactOnEvent = (emoji: string): void => {
+            void reactFn(emoji).catch(() => {});
+          };
+
           // Dispatch reply through the full pipeline
           await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
             ctx: ctxPayload,
@@ -349,6 +364,9 @@ export const nip17Plugin: ChannelPlugin<ResolvedNip17Account> = {
               onModelSelected,
               onReplyStart: typing.onReplyStart,
               onTypingCleanup: typing.onCleanup,
+              onToolStart: () => reactOnEvent(EVENT_EMOJI.toolStart),
+              onPlanUpdate: () => reactOnEvent(EVENT_EMOJI.planUpdate),
+              onCompactionStart: () => reactOnEvent(EVENT_EMOJI.compactionStart),
               deliver: async (payload: { text?: string; mediaPath?: string }) => {
                 const responseText = payload.text ?? "";
                 if (responseText.trim()) {
