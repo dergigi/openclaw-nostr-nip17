@@ -128,7 +128,11 @@ export function normalizePubkey(input: string): string {
   if (trimmed.startsWith("npub1")) {
     const decoded = nip19.decode(trimmed);
     if (decoded.type !== "npub") throw new Error("Invalid npub key");
-    return Array.from(decoded.data as unknown as Uint8Array)
+    const data = decoded.data;
+    if (typeof data === "string" && /^[0-9a-fA-F]{64}$/.test(data)) {
+      return data.toLowerCase();
+    }
+    return Array.from(data as unknown as Uint8Array)
       .map((b) => b.toString(16).padStart(2, "0"))
       .join("");
   }
