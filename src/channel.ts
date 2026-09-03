@@ -33,11 +33,15 @@ const EVENT_EMOJI = {
 
 function readRuntimeConfig(runtime: { config?: unknown }): Record<string, unknown> {
   const c = runtime.config as {
+    current?: () => unknown;
     loadConfig?: () => unknown;
     get?: () => unknown;
   } | Record<string, unknown> | (() => unknown) | undefined;
   if (!c) return {};
   if (typeof c === "function") return (c() as Record<string, unknown>) ?? {};
+  if (typeof (c as { current?: unknown }).current === "function") {
+    return ((c as { current: () => unknown }).current() as Record<string, unknown>) ?? {};
+  }
   if (typeof (c as { loadConfig?: unknown }).loadConfig === "function") {
     return ((c as { loadConfig: () => unknown }).loadConfig() as Record<string, unknown>) ?? {};
   }
